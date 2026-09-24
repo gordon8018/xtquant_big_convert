@@ -29,7 +29,7 @@
 
 ### `ping`
 - **参数**：无
-- **返回**：`{"pong": True, "account_id": "...", "server_time": "YYYY-MM-DD HH:MM:SS"}`
+- **返回**：`{"pong": True, "account_id": "...", "account_type": "STOCK", "account_types": ["STOCK", ...], "server_time": "YYYY-MM-DD HH:MM:SS"}`——`account_types` 是这个账号可按哪些类型查（`BIGQMT_ACCOUNT_TYPE` 写成列表时不止一个，港股通）
 - **用途**：探活、确认 RPC 服务在线与归属账号。
 - **实测延迟**：Redis ~13ms（p50）。
 
@@ -120,7 +120,7 @@
 
 **合成周期回落与「这一份不全」标记（#237）**
 
-部分终端构建（实测国金 **2.0.8.0**）上，凡是走 C++ `context.get_market_data2`
+部分终端构建（实测某券商 **2.0.8.0**）上，凡是走 C++ `context.get_market_data2`
 的路径对 `1mon/1q/1hy/1y` 恒返回 0 行，而同一进程里 `ContextInfo.get_market_data`
 给得出来。主路径（含 #219 的 11 列重试）全空且周期属于合成周期时，桥会**逐只代码**
 改走 `ContextInfo.get_market_data` 取数。
@@ -174,7 +174,7 @@ FormulaServer 直连不认这个参数，带上它会强制回落到 RPC 桥（�
 2. `ContextInfo.get_sector_list`（不存在，跳过）
 3. 两者都拿不到时**直接抛 `NotImplementedError`**，不再静默返回兜底清单（#143）。要那 13 个常用板块名请显式传 `allow_fallback=True`，它们可继续驱动 `get_stock_list_in_sector(name)`。
 
-**兜底清单里的名字都在国金大 QMT 2.1.19.0 上实测过**（2026-09-11）。A 股的两半拼作 `上证A股` / `深证A股`（2318 / 2902 只，合计等于 `沪深A股` 的 5220），`沪市A股` / `深市A股` 返回 0；基金则相反，`沪市基金` / `深市基金` 有数据，`上证基金` / `深证基金` 返回 0。拼法没有规律，`get_stock_list_in_sector` 拼错也不报错、只给空列表，所以看到空结果先核对名字。完整对照表见 README「板块」一节。
+**兜底清单里的名字都在大 QMT 2.1.19.0 上实测过**（2026-09-11）。A 股的两半拼作 `上证A股` / `深证A股`（2318 / 2902 只，合计等于 `沪深A股` 的 5220），`沪市A股` / `深市A股` 返回 0；基金则相反，`沪市基金` / `深市基金` 有数据，`上证基金` / `深证基金` 返回 0。拼法没有规律，`get_stock_list_in_sector` 拼错也不报错、只给空列表，所以看到空结果先核对名字。完整对照表见 README「板块」一节。
 
 ### 3.4 交易日历 / 节假日
 
@@ -305,7 +305,7 @@ FormulaServer 直连不认这个参数，带上它会强制回落到 RPC 桥（�
 包装，直接 `xtdata.get_open_date("600519.SH")` 即可，参数名同上表。没有同名包装
 的方法走万能入口 `xtdata.call_method("<name>", **params)` / `xt_trader.client.call("<name>", params)`。
 
-**实测记录（2026-09-09 收盘后，国金大 QMT 2.1.19.0，非交易时段）**——上表几处订正的
+**实测记录（2026-09-09 收盘后，大 QMT 2.1.19.0，非交易时段）**——上表几处订正的
 依据，和两个「答不了」的判据。⚠️ `get_svol` / `get_bvol` 是**盘中窗口量**，同一组代码
 在盘中重测会是另一批数字；其余几行（股本、上市日期、到期日）与时段无关。
 
@@ -366,6 +366,11 @@ FormulaServer 直连不认这个参数，带上它会强制回落到 RPC 桥（�
 ## 4. 账户 / 持仓 / 委托
 
 下列方法的 `account_id` 参数均可选（不传则用服务端配置的账号）。也接受 `account`（对象/dict）。
+
+所有交易类方法（本节、第 5 节下单撤单、第 6 节账户扩展查询）还接受可选的 `account_type`
+（`"STOCK"` / `"CREDIT"` / `"FUTURE"` / `"HUGANGTONG"` / `"SHENGANGTONG"` / ...，或 xtconstant 的数字）：
+客户端 `StockAccount(id, "HUGANGTONG")` 的类型就是这样传来的。服务端只在该账号配置允许时按它查
+（`BIGQMT_ACCOUNT_TYPE` 或 `BIGQMT_ACCOUNT_TYPE_MAP` 的值写成列表），否则按配置的默认类型答并记一次日志。
 
 ### `get_asset`
 - **别名**：`query_stock_asset`
@@ -513,7 +518,13 @@ FormulaServer 直连不认这个参数，带上它会强制回落到 RPC 桥（�
   50-59、期货 0-15、可转债转股/回售 80-83（普通户 80/81，信用户 82/83）原样透传）。有方向的类型不用传 `action`，桥按类型定；**直接还款（32/45）、
   行权/锁定（56-59）没有买卖方向**，也不用传（#314）——记账方向记 `SELL`，`passorder` 收到的仍
   是原始 opType。归还融资按 MiniQMT 写法：`order_stock(acc, 任一代码占位, CREDIT_DIRECT_CASH_REPAY,
-  还款金额, FIX_PRICE, 0, strategy, remark)`，金额走 `volume`，价格填 0。
+  还款金额, FIX_PRICE, 0, strategy, remark)`——**金额走 `order_volume`（整数元），`price` 被
+  passorder 忽略**（#330：把金额放 price、volume 传可用资金，还的是 volume 那个数）。直接还款
+  在委托列表里通常**没有行**，结算到期查不到不算失败：`order_sys_id` 为 None、不设
+  `server_error`，`order_stock` 返回 -1 且不抛，`message` 提示用 `query_credit_detail` 核对。
+- **`wait_settlement=False`**（`order_stock_async` 用）：立即回复，但服务端仍以影子结算盯到期限；
+  到期委托列表里没有这张单就推一条 `order_error`（`source="settlement"`）——终端在下单前拦下的
+  单（资金不足弹窗）只有这一条信号（#345）。
 - **期限**：信封里的 `timeout_seconds`（客户端 `call` 自动带上）是调用方等多久。服务端按自己
   收到请求的时刻计龄，轮到执行时已过期限（留 1s 余量，最多期限的 1/4）的下单请求**拒绝
   而不执行**，`error` 以 `RequestExpired` 开头并明确写「没下单」（#303）。下单在 QMT 策略

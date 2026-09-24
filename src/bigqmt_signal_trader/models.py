@@ -332,11 +332,16 @@ class OrderRequest:
         strategy_name,
         remark="",
         order_type=None,
+        account_type=None,
     ):
         # MiniQMT-style order_type (xtconstant). Only set for operations a
         # BUY/SELL action cannot express -- credit financing, repayment and the
         # special-margin family. None means an ordinary stock order.
         self.order_type = order_type
+        # The account type the request named (港股通: "HUGANGTONG" on a stock
+        # account id). The settlement lookup reads the order back under it;
+        # None means the account's default.
+        self.account_type = account_type
         self.signal_id = signal_id
         self.account_id = account_id
         self.action = action
@@ -379,6 +384,9 @@ class OrderSnapshot:
         offset_flag=None,
         direction=None,
         trade_amount=0.0,
+        op_type=None,
+        entrust_type=None,
+        opt_name="",
     ):
         self.order_sys_id = order_sys_id
         self.user_order_id = user_order_id
@@ -389,6 +397,19 @@ class OrderSnapshot:
         self.status = status
         self.price = price
         self.traded_price = traded_price
+        # The terminal's own m_nOpType (27 融资买入, 31 卖券还款, ...). BUY/SELL
+        # above is derived from it for bookkeeping; the client needs the
+        # original to report a credit order as its MiniQMT order_type instead
+        # of plain 23/24 (#330).
+        self.op_type = op_type
+        # 官方 ORDER 字段 m_eEntrustType（EEntrustTypes 委托类别：54 融资 /
+        # 55 融券 / 56 信用平仓 / 57 信用普通）。信用委托真正的判别字段——
+        # reporter 实盘数据证实 m_nOpType 分不出融资买入和担保品买入，
+        # m_eEntrustType 分得清（#330 跟修）。0.3.52 之前的服务端没有它。
+        self.entrust_type = entrust_type
+        # 官方 ORDER 字段 m_strOptName（直接给「融资买入」「担保品买入」的
+        # 名称），目前只用来识别「专项」。
+        self.opt_name = opt_name
         self.strategy_name = strategy_name
         self.remark = remark
         # 报单时间, Unix 秒 -- MiniQMT XtOrder.order_time 的语义。0 = 未上报。
@@ -421,7 +442,7 @@ class TradeSnapshot:
                  traded_at="", user_order_id="", amount=0.0, strategy_name="",
                  traded_time=0, account_type=0, instrument_name="",
                  secu_account="", commission=0.0, offset_flag=None,
-                 direction=None):
+                 direction=None, op_type=None, entrust_type=None, opt_name=""):
         self.trade_id = trade_id
         self.order_sys_id = order_sys_id
         self.stock_code = stock_code
@@ -446,6 +467,10 @@ class TradeSnapshot:
         self.commission = commission
         self.offset_flag = offset_flag
         self.direction = direction
+        self.op_type = op_type
+        # 同 OrderSnapshot：m_eEntrustType 是信用委托的可靠判别字段（#330）。
+        self.entrust_type = entrust_type
+        self.opt_name = opt_name
 
 
 class OrderRef:

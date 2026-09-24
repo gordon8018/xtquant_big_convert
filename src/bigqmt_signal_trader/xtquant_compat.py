@@ -28,6 +28,7 @@ from xtquant import xtconstant as _xtconstant
 from xtquant.xtconstant import ORDER_UNKNOWN, STOCK_BUY, STOCK_SELL
 from xtquant.xttype import StockAccount
 
+from .code_utils import is_bond_code
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
 from .order_id import OrderId, order_sys_id_of
@@ -291,6 +292,25 @@ def _quote_push_zmq_address(client):
     return "tcp://%s:%d" % (host, base_port + 1)
 
 
+def _build_quote_push_channel(client):
+    """Build the push-channel subscriber matching the RPC transport: redis
+    deployments derive the channel locally; zmq deployments connect to the
+    server PUB socket (host from zmq config, RPC port + 1).
+
+    Module-level on purpose: BigQmtXtTrader's exec-event listener needs it too,
+    and when it lived only on BigQmtXtData the trader's call raised
+    AttributeError into a silent retry loop — zmq deployments never got a
+    single exec callback (#366, broken since #76).
+    """
+    from .quote_push_channel import RedisQuotePushChannel, ZmqQuotePushChannel
+
+    transport_name = str(getattr(client, "transport_name", "redis") or "redis").lower()
+    if transport_name in ("zmq",):
+        address = _quote_push_zmq_address(client)
+        return ZmqQuotePushChannel(connect_address=address)
+    return RedisQuotePushChannel(client._redis(), account_id=client.account_id)
+
+
 def _missing_account_id_message():
     """Say what was searched and what to do, not just that something is missing.
 
@@ -384,6 +404,27 @@ def load_client_config(module_name=None):
     return {}
 
 
+def _account_type_param(account):
+    """The type name a StockAccount declares, "" for a bare id string.
+
+    Sent as the ``account_type`` param of every trade RPC (港股通 on a stock
+    account: StockAccount(id, "HUGANGTONG") reads the HUGANGTONG book). The
+    server honours it only when the account is configured for that type,
+    otherwise the deployment's own type answers, as always (#92).
+    """
+    if account is None or isinstance(account, (str, dict)):
+        return ""
+    return _account_type_name(getattr(account, "account_type", None))
+
+
+def _with_account_type(params, account):
+    """``params`` plus the account's declared type, when it declares one."""
+    name = _account_type_param(account)
+    if name:
+        params["account_type"] = name
+    return params
+
+
 def _account_id(account, fallback=""):
     if account is None:
         return str(fallback or "")
@@ -448,6 +489,96 @@ def _as_list(value):
     if isinstance(value, list):
         return value
     return [value]
+
+
+# Big QMT m_nOpType -> MiniQMT order_type for the credit family (#330). 27-32
+# are the same number in both; big QMT's 33/34 (担保品买入/卖出) are MiniQMT's
+# CREDIT_BUY/CREDIT_SELL (23/24); the 专项 family is 70-75 there, 40-45 here.
+# 80-83 (可转债转股/回售) have no MiniQMT constant and pass through.
+_CREDIT_ORDER_TYPE_BY_OP = {
+    27: 27, 28: 28, 29: 29, 30: 30, 31: 31, 32: 32,
+    33: 23, 34: 24,
+    70: 40, 71: 41, 72: 42, 73: 43, 74: 44, 75: 45,
+    80: 80, 81: 81, 82: 82, 83: 83,
+}
+
+
+def _credit_order_type_from_op(op_type, fallback):
+    """The MiniQMT order_type for a row's native opType, else ``fallback``.
+
+    query_stock_orders used to derive order_type from BUY/SELL alone, so a
+    融资买入 (opType 27) read as STOCK_BUY 23 (#330). Only the credit and
+    convertible families are mapped; ordinary 23/24 and the futures/option
+    numbers keep whatever the side-based logic decided.
+    """
+    try:
+        value = int(op_type)
+    except (TypeError, ValueError):
+        return fallback
+    return _CREDIT_ORDER_TYPE_BY_OP.get(value, fallback)
+
+
+# enum_EEntrustTypes（迅投知识库）: 54 融资委托 / 55 融券委托 / 57 信用普通委托。
+# reporter 实盘数据（#330, 2026-09-23）: 融资买入 m_eEntrustType=54、担保品
+# 买入=57，而 m_nOpType 两者没有区别——0.3.52 按 m_nOpType 的判据因此
+# 对这批终端永不生效。m_eEntrustType + 开平方向才是可靠判据。
+_CREDIT_ORDER_TYPE_BY_ENTRUST = {
+    # (entrust_type, is_buy) -> MiniQMT order_type
+    (54, True): 27,    # 融资委托 + 买 = 融资买入 CREDIT_FIN_BUY
+    (54, False): 31,   # 融资委托 + 卖 = 卖券还款 CREDIT_SELL_SECU_REPAY
+    (55, True): 29,    # 融券委托 + 买 = 买券还券 CREDIT_BUY_SECU_REPAY
+    (55, False): 28,   # 融券委托 + 卖 = 融券卖出 CREDIT_SLO_SELL
+    (57, True): 23,    # 信用普通委托 + 买 = 担保品买入 CREDIT_BUY
+    (57, False): 24,   # 信用普通委托 + 卖 = 担保品卖出 CREDIT_SELL
+}
+
+# 「专项」名称只从 m_strOptName 拿（entrust 枚举不分专项）。
+_CREDIT_SPECIAL_UPGRADE = {27: 40, 28: 41, 29: 42, 31: 44, 32: 45}
+
+
+def _credit_order_type_from_entrust(entrust_type, offset_flag, opt_name, fallback):
+    """The MiniQMT order_type from m_eEntrustType + side, else ``fallback``.
+
+    ``opt_name`` 含「专项」时升级到专项族（40-45）；56 信用平仓等未列出的
+    类别回退给调用方的下一个判据。
+    """
+    try:
+        entrust = int(entrust_type)
+    except (TypeError, ValueError):
+        return fallback
+    try:
+        side = int(offset_flag)
+    except (TypeError, ValueError):
+        return fallback
+    if side == 48:
+        is_buy = True
+    elif side == 49:
+        is_buy = False
+    else:
+        return fallback
+    mapped = _CREDIT_ORDER_TYPE_BY_ENTRUST.get((entrust, is_buy))
+    if mapped is None:
+        return fallback
+    if "专项" in str(opt_name or ""):
+        mapped = _CREDIT_SPECIAL_UPGRADE.get(mapped, mapped)
+    return mapped
+
+
+def _credit_order_type_for_row(item, fallback):
+    """Credit order_type for a snapshot dict: entrust first, op second (#330).
+
+    0.3.55+ 的服务端在快照里带 m_eEntrustType；老服务端/老终端没有它时
+    退回 0.3.52 的 m_nOpType 映射，再不行才用方向推的 23/24。
+    """
+    order_type = _credit_order_type_from_entrust(
+        item.get("entrust_type"),
+        item.get("offset_flag", item.get("direction")),
+        item.get("opt_name"),
+        None)
+    if order_type is not None:
+        return order_type
+    return _credit_order_type_from_op(item.get("op_type"), fallback)
+
 
 
 def _account_type_name(value):
@@ -1095,11 +1226,50 @@ def _ensure_preclose_from_lag(df, field_list=None, period=None):
         return df
 
 
+def _ensure_suspend_flag_column(df, field_list=None):
+    """suspendFlag 列形状兜底: 空 field_list(=全字段)或点名时, 缺列则补 0。
+
+    合成回落帧(``synth_period_primary_empty``, #237)的 servant
+    (ContextInfo.get_market_data)只服务 OHLCV+amount 六列, 实测把
+    suspendFlag 混进请求会让整个请求 0 行, 所以服务端给不出这列——
+    MiniQMT 的同请求却带全部 11 列。下游按 MiniQMT 习惯读
+    ``df["suspendFlag"]`` 会 KeyError; 自己 concat 补列会拿到 NaN,
+    对它做整数转换直接 ValueError。
+
+    与 ``_ensure_preclose_from_lag`` 的缺列分支同一条边界: 只在调用方
+    要了这列(field_list 为空或点了 suspendFlag)时补列, 显式点名清单
+    不多出列。值填 0 与该函数对停牌/无数据帧的处理一致(避免下游
+    KeyError); 注意 0 是形状契约的默认值, 不是合成周期的真实停牌
+    标志——真值需要按日线聚合(suspendFlag 在日线 RPC 有真值), 可作
+    后续增强, 同 preClose 的 #166 精确回填之于 lag 的关系。
+    """
+    try:
+        if not hasattr(df, "columns"):
+            return df
+        if "suspendFlag" in df.columns:
+            return df
+        requested = [str(f) for f in (field_list or [])]
+        if requested and "suspendFlag" not in requested:
+            return df
+        out = df.copy()
+        out["suspendFlag"] = 0
+        return out
+    except Exception:
+        return df
+
+
+def _ensure_kline_columns(df, field_list=None, period=None):
+    """K 线可选列的形状兜底组合: preClose(lag) 之后补 suspendFlag。"""
+    return _ensure_suspend_flag_column(
+        _ensure_preclose_from_lag(df, field_list=field_list, period=period),
+        field_list=field_list)
+
+
 def _normalize_market_data_result(data, field_list=None, period=None):
     if not isinstance(data, dict):
-        return _ensure_preclose_from_lag(data, field_list=field_list, period=period)
+        return _ensure_kline_columns(data, field_list=field_list, period=period)
     return {
-        code: _ensure_preclose_from_lag(
+        code: _ensure_kline_columns(
             _normalize_market_data_frame(frame, field_list=field_list),
             field_list=field_list, period=period)
         for code, frame in data.items()
@@ -1630,6 +1800,62 @@ def _markets_of(codes):
             return set()
         markets.add(suffix)
     return markets
+
+
+# Which instrument kinds a market token has to be asked for, per exchange.
+#
+# The server narrows a market token to `types` and defaults to ("stock",) --
+# "SH" becomes the 上证A股 sector listing. So a token request that does not say
+# what it wants silently loses convertibles, funds, ETFs and indices: they are
+# subscribed and pushed, but absent from the first frame (#358). Asking for
+# ["all"] instead costs the whole exchange listing (26744 instruments, ~7.5s on
+# the adjust thread), which is exactly what #247/#104 removed. So infer the
+# kinds from the codes actually asked for.
+#
+# Prefixes are the exchanges' own code segments. Convertibles are not listed
+# here -- code_utils.is_bond_code already owns those prefixes, and duplicating
+# them is how the two copies drift apart.
+#
+#   SH  600/601/603/605/688/689 股票 · 5xx 基金/ETF · 000xxx 指数
+#   SZ  00x/30x 股票 · 15x/16x/18x 基金/ETF · 39xxxx 指数 (980xxx.SZ 也是指数，
+#       不在「沪深指数」板块里，所以不认它)
+#   BJ  43/83/87/88/92 股票 (899050.BJ 北证50 is an index and 沪深指数 does not
+#       carry it, so it stays unclassified on purpose)
+#
+# A code that matches nothing here is NOT guessed at: it goes down the direct
+# per-code path instead, which is slower and right. Guessing is how the codes
+# went missing in the first place.
+_PRIME_TYPES_BY_PREFIX = {
+    "SH": ((("600", "601", "603", "605", "688", "689"), ("stock",)),
+           (("5",), ("fund", "etf")),
+           (("000",), ("index",))),
+    # 30 rather than 300/301: 深证A股 already lists 302132.SZ, and the 30x
+    # segment is 创业板 only, so widening it cannot swallow another kind.
+    "SZ": ((("000", "001", "002", "003", "30"), ("stock",)),
+           (("15", "16", "18"), ("fund", "etf")),
+           (("39",), ("index",))),
+    "BJ": ((("43", "83", "87", "88", "92"), ("stock",)),),
+}
+
+
+def _prime_tick_types(code):
+    """Instrument kinds to narrow a market token to for `code`, or ().
+
+    () means "not confidently classified" -- the caller must not narrow on this
+    code's behalf.
+    """
+    text = str(code or "").strip().upper()
+    if "." not in text:
+        return ()
+    pure, _, market = text.partition(".")
+    if not pure.isdigit():
+        return ()
+    if is_bond_code(text):
+        return ("convertible",)
+    for prefixes, kinds in _PRIME_TYPES_BY_PREFIX.get(market, ()):
+        if pure.startswith(prefixes):
+            return kinds
+    return ()
 
 
 def _full_tick_params(codes, types=None):
@@ -2516,6 +2742,7 @@ class BigQmtXtData:
         backfill_pre_close=True,
         resynth_ongoing_multiday=True,
         heal=True,
+        subscribe=None,
     ):
         """Pull bars over RPC, in batches of ``chunk_size`` codes.
 
@@ -2525,6 +2752,11 @@ class BigQmtXtData:
         waiting for a download it just submitted, and healing there
         re-submits that same download every 1.5s round, pushing the landing
         it is waiting for further back until the 60s budget is gone.
+
+        ``subscribe`` 是 QMT 原生签名的最后一个参数：True（大 QMT 默认）会把
+        查过的标的塞进常驻内存订阅池，批量拉分钟线时终端内存单调上涨直到崩溃
+        （#361）；False 只读本地已下载数据。缺省 None = 不传、维持原生默认。
+        批量历史回补请显式传 ``subscribe=False``。
 
         Cache-through: whatever is fetched is written to the local cache (keyed
         by dividend_type), so it stays the latest -- important for 前复权 data,
@@ -2560,6 +2792,9 @@ class BigQmtXtData:
             dividend_type=dividend_type,
             fill_data=fill_data,
         )
+        if subscribe is not None:
+            # 只在调用方给了才传（#361）：不给 = 大 QMT 原生默认 True，行为不变。
+            base["subscribe"] = bool(subscribe)
         step = DEFAULT_MARKET_DATA_CHUNK if chunk_size is None else int(chunk_size)
 
         if step <= 0 or len(codes) <= step:
@@ -2676,9 +2911,9 @@ class BigQmtXtData:
                     )
                 data = payload.get(single) if single is not None else payload
             if isinstance(data, dict):
-                return {code: _ensure_preclose_from_lag(frame, field_list=field_list, period=period)
+                return {code: _ensure_kline_columns(frame, field_list=field_list, period=period)
                         for code, frame in data.items()}
-            return _ensure_preclose_from_lag(data, field_list=field_list, period=period)
+            return _ensure_kline_columns(data, field_list=field_list, period=period)
         fields = list(field_list or [])
         result = {}
         missing = []
@@ -2697,7 +2932,7 @@ class BigQmtXtData:
                 df = fetched.get(code)
                 if df is not None and getattr(df, "shape", (0,))[0] > 0:
                     result[code] = self._select_fields(
-                        _ensure_preclose_from_lag(
+                        _ensure_kline_columns(
                             _normalize_market_data_frame(df, field_list=fields),
                             field_list=fields, period=period),
                         fields,
@@ -2746,6 +2981,60 @@ class BigQmtXtData:
         except Exception:
             return False
 
+    @staticmethod
+    def _is_placeholder_frame(frame):
+        """One code's frame is a no-trade placeholder: every bar has
+        ``volume == 0`` and ``suspendFlag == 1``.
+
+        Big QMT answers a window it has no local bars for with placeholder
+        bars rather than an empty frame, and the fill differs by build. The
+        国金 terminal fills zeros (the all-zero shape ``_is_all_zero_any``
+        catches). A 华泰 terminal on 0.3.40 filled the previous close into
+        open/high/low/close instead (#339, @wolfeee: 002594.SZ 1m from
+        20260918 answered 150 bars dated 20260919 -- a Saturday -- all at
+        84.3, volume 0, suspendFlag 1). Nonzero prices slip past the
+        all-zero detector, so the heal never fired and the caller was handed
+        a day of flat fake bars with nothing said. Both columns are required:
+        a frame without ``suspendFlag`` (the FormulaServer six-column path)
+        never matches, and one nonzero volume anywhere means real trades.
+        """
+        cols = getattr(frame, "columns", None)
+        if cols is None:
+            return False
+        cols = list(cols)
+        if "volume" not in cols or "suspendFlag" not in cols:
+            return False
+        if len(frame) == 0:
+            return False
+        try:
+            return bool((frame["volume"] == 0).all() and (frame["suspendFlag"] == 1).all())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_placeholder_all(data):
+        """Every served frame is a placeholder (see ``_is_placeholder_frame``).
+
+        ``all`` rather than ``any`` on purpose: a genuinely suspended stock
+        answers the same shape truthfully, and one of those inside a
+        portfolio read must not turn the whole read into a per-call heal
+        (download + sleep + re-read). Every code flat at once is the
+        raw-store-not-populated signal, the same reasoning as the majority
+        guard on the none-adjusted branch.
+        """
+        try:
+            cols = getattr(data, "columns", None)
+            if cols is not None:
+                return BigQmtXtData._is_placeholder_frame(data)
+            if isinstance(data, dict) and data:
+                frames = [v for v in data.values() if getattr(v, "columns", None) is not None]
+                if not frames:
+                    return False
+                return all(BigQmtXtData._is_placeholder_frame(v) for v in frames)
+            return False
+        except Exception:
+            return False
+
     def _ensure_server_raw(self, codes, period, start_time, end_time):
         """Trigger a server-side raw download so adjusted bars can be computed."""
         try:
@@ -2776,13 +3065,20 @@ class BigQmtXtData:
     def _heal_adjusted(self, method, params, data, wait_seconds=2.0, timeout_seconds=None):
         """Self-heal reads served from an unready raw store: if the adjusted
         pull came back all-zero, or a none-adjusted pull came back missing
-        most requested codes, trigger a server-side raw download, wait for
-        async landing, retry once."""
+        most requested codes, or every code came back as a no-trade
+        placeholder frame (#339), trigger a server-side raw download, wait
+        for async landing, retry once."""
         dividend_type = str(params.get("dividend_type") or "none").lower()
         codes = list(params.get("stock_list") or params.get("stock_code") or [])
         if not codes:
             return data
-        if dividend_type in ("", "none"):
+        if self._is_placeholder_all(data):
+            # Applies on both branches: the placeholder fill is a raw-store
+            # answer, not an adjustment artefact, so a none-adjusted read
+            # gets the same flat bars -- and those codes count as *served*,
+            # which is why the missing-majority guard below never sees them.
+            pass
+        elif dividend_type in ("", "none"):
             # None-adjusted bars are never zero-filled, so the all-zero
             # detector does not apply -- a *missing* code means the server
             # has no raw bars for it at all. Big QMT's raw store is not
@@ -2808,8 +3104,27 @@ class BigQmtXtData:
         )
         time.sleep(wait_seconds)
         if timeout_seconds is not None:
-            return self.client.call(method, params, timeout_seconds=timeout_seconds)
-        return self._call(method, **params)
+            healed = self.client.call(method, params, timeout_seconds=timeout_seconds)
+        else:
+            healed = self._call(method, **params)
+        if self._is_placeholder_all(healed):
+            # The download did not change the answer: either the terminal
+            # has no data to download for this window (a real suspension,
+            # or the reporter's terminal where the download RPC itself
+            # answers False, #339) -- say so rather than hand back a flat
+            # frame that reads like bars.
+            log.warning(
+                "%s %s %s %s~%s: every bar is volume 0 / suspendFlag 1 after a "
+                "server-side download and retry. These are Big QMT placeholder "
+                "bars, not trades -- the terminal has no local %s data for this "
+                "window. Check download_history_data2 on this terminal "
+                "(probe_capabilities -> qmt_globals) or download the period in "
+                "the terminal's 数据管理 first.",
+                method, ",".join(codes[:5]) + (",..." if len(codes) > 5 else ""),
+                params.get("period", "1d"), params.get("start_time", ""),
+                params.get("end_time", ""), params.get("period", "1d"),
+            )
+        return healed
 
     def _pull_and_cache(self, codes, period, start_time, end_time, count, dividend_type="none"):
         """Fetch codes over RPC (get_market_data_ex already caches them)."""
@@ -2946,17 +3261,7 @@ class BigQmtXtData:
         )
 
     def _build_quote_push_channel(self):
-        """Build the push-channel subscriber matching the RPC transport: redis
-        deployments derive the channel locally; zmq deployments connect to the
-        server PUB socket (host from zmq config, RPC port + 1)."""
-        client = self.client
-        from .quote_push_channel import RedisQuotePushChannel, ZmqQuotePushChannel
-
-        transport_name = str(getattr(client, "transport_name", "redis") or "redis").lower()
-        if transport_name in ("zmq",):
-            address = _quote_push_zmq_address(client)
-            return ZmqQuotePushChannel(connect_address=address)
-        return RedisQuotePushChannel(client._redis(), account_id=client.account_id)
+        return _build_quote_push_channel(self.client)
 
     def quote_subscription_status(self):
         """What whole-quote combos the bridge thinks are alive, and how stale.
@@ -2996,6 +3301,12 @@ class BigQmtXtData:
         # get_full_tick with those tokens -- QMT handles exchange tokens as
         # whole-exchange operations (fast). Then filter the result to only the
         # codes the caller actually asked for.
+        #
+        # The token path cannot pass ["all"] -- that is the 26744-instrument
+        # read #247 removed -- so it passes the kinds the requested codes
+        # actually are (#358). Saying nothing there is what made convertibles
+        # disappear from the first frame above 100 codes while the push kept
+        # delivering them.
         if callback is not None:
             try:
                 # Called unconditionally, including with an empty snapshot:
@@ -3048,12 +3359,25 @@ class BigQmtXtData:
         if whole:
             wanted = set()
             tokens = set()
+            kinds = set()
             for code in whole:
+                code_kinds = _prime_tick_types(code)
+                if not code_kinds:
+                    # Unclassified: the server would narrow the token to stocks
+                    # and drop this code without saying so (#358). Read it
+                    # directly instead -- slow beats silently absent.
+                    direct.append(code)
+                    continue
                 wanted.add(code.upper())
                 tokens.add(code.rsplit(".", 1)[-1].upper())
-            full = self.get_full_tick(sorted(tokens)) or {}
-            snapshot.update(
-                (k, v) for k, v in full.items() if str(k).upper() in wanted)
+                kinds.update(code_kinds)
+            if tokens:
+                # types= is what keeps the push side and the primer covering the
+                # same instruments: the push is ContextInfo's own
+                # subscribe_whole_quote and is not narrowed at all.
+                full = self.get_full_tick(sorted(tokens), types=sorted(kinds)) or {}
+                snapshot.update(
+                    (k, v) for k, v in full.items() if str(k).upper() in wanted)
         if direct:
             # No whole-market token for these (futures, and anything new).
             # Slow for a long list, but slow-and-correct beats fast-and-empty:
@@ -3108,7 +3432,7 @@ class BigQmtXtData:
                           start_time=start_time, end_time=end_time)
         return _divid_factors_frame(data)
 
-    def download_history_data2(self, stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None, download_timeout_seconds=180.0, data_wait_seconds=60.0):
+    def download_history_data2(self, stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None, download_timeout_seconds=180.0, data_wait_seconds=10.0):
         """Pull bars from Big QMT over RPC and cache them locally, in batches.
 
         Mirrors xtdata.download_history_data2: after this, get_local_data(..., the
@@ -3130,10 +3454,21 @@ class BigQmtXtData:
         ``download_timeout_seconds`` covers the server-side download only; it is
         generous because a cold code with a wide window can take minutes.
 
+        ``data_wait_seconds`` is how long a batch keeps re-polling for codes the
+        first pull came back empty for. The server download returns after the
+        data landed (measured: 20,726 1m bars readable 0.3s after a 0.6-1.4s
+        download), so an empty first pull almost always means the terminal
+        has nothing for that code (suspended, new, delisted) and will not get
+        it by waiting. The old default of 60s made one such code hold its
+        whole batch for a minute (#339: "12s per contract" on 300 contracts).
+        10s is a few polls, enough for a terminal that lands data late.
+
         The server-side download is best-effort while the client pull can still
         save it (cache enabled), but with the local cache disabled it is the
         entire job -- its failure raises instead of reporting {finished: total},
-        which would be the fake progress of issue #47.
+        which would be the fake progress of issue #47. With the cache enabled
+        the same applies once the pull comes back empty for a code: a failed
+        download that nothing stood in for raises, naming the codes (#339).
         """
         codes = [str(c) for c in (stock_list or []) if str(c or "").strip()]
         if not codes:
@@ -3158,7 +3493,7 @@ class BigQmtXtData:
         # or the result is all zeros.
         server_download_error = None
         try:
-            self.client.call(
+            download_reply = self.client.call(
                 "download_history_data2",
                 {
                     "stock_list": codes,
@@ -3168,6 +3503,14 @@ class BigQmtXtData:
                 },
                 timeout_seconds=float(download_timeout_seconds),
             )
+            if not download_reply:
+                # 服务端显式回 False = 下载任务没被受理（#339：恒 False 曾经
+                # 从这里漏过去，下面的空拉被当成「停牌/退市」容忍掉，最终报出
+                # finished==total 的假进度）。失败必须响（#47 契约）。
+                server_download_error = RuntimeError(
+                    "server reported download_history_data2 = %r: the terminal "
+                    "did not accept the download task (codes=%d period=%s)" % (
+                        download_reply, len(codes), period))
         except Exception as exc:
             # Best-effort only while the pull below can still save the
             # download (data already on the server). With the local cache
@@ -3218,7 +3561,9 @@ class BigQmtXtData:
                     count=-1,
                     dividend_type=dividend_type,
                     fill_data=False,  # fill 会用全 0 占位行冒充数据，轮询判定必须关掉
-                    timeout_seconds=float(data_wait_seconds),
+                    # The RPC timeout for one pull is not the poll budget: a
+                    # batch of 300 codes x 20k bars is a multi-second reply.
+                    timeout_seconds=max(float(data_wait_seconds), 60.0),
                     # 等的就是刚提交的那笔下载。heal 看到「还没落地」会把它原样
                     # 再提交一遍、睡 2 秒、再读——每轮如此，等待目标被反复推后，
                     # 单票冷启动必然打满 60 秒（#275）。轮询里的读不参与 heal。
@@ -3232,6 +3577,23 @@ class BigQmtXtData:
                 if ready >= len(batch) or time.time() >= deadline:
                     break
                 time.sleep(1.5)
+            if server_download_error is not None and ready < len(batch):
+                # The server-side download failed AND the pull found nothing
+                # to save for some of the batch: the download did not happen
+                # and nothing stands in for it. Reporting {finished: total}
+                # here is the fake progress of #47 one branch over (#339).
+                # A failed download whose bars were already on the server
+                # still finishes above (ready == len(batch)); an empty code
+                # after a download that did NOT fail keeps the tolerant
+                # timeout (suspended / delisted codes have no bars to wait for).
+                missing = [code for code in batch
+                           if getattr((data or {}).get(code), "shape", (0,))[0] == 0]
+                raise RuntimeError(
+                    "download_history_data2 %s %s~%s: the server-side download "
+                    "failed (%s) and the pull found no rows for %s -- nothing was "
+                    "downloaded for these codes" % (
+                        period, start_time, end_time, server_download_error,
+                        ",".join(missing)))
             for code in batch:
                 finished += 1
                 if callback is not None:
@@ -3954,6 +4316,7 @@ class BigQmtXtTrader:
         # client's StockAccount(..., "CREDIT") never travels -- so prefer what
         # ping reports, fall back to what the caller declared.
         self._server_account_type = ""
+        self._server_account_types = []
         self._declared_account_type = ""
         # Set once the exec-event listener is really subscribed; start() waits
         # on it instead of sleeping blind. Never cleared on reconnect rounds --
@@ -4086,14 +4449,25 @@ class BigQmtXtTrader:
         return 0
 
     def connect(self):
-        if self.client.account_id:
-            pong = self.client.call("ping")
-            self._note_server_account_type(pong)
-            mismatch = warn_on_version_mismatch(pong)
-            if mismatch and auto_sync_enabled():
-                self.sync_deployment()
-        self._fire_account_status()
-        return 0
+        try:
+            if self.client.account_id:
+                pong = self.client.call("ping")
+                self._note_server_account_type(pong)
+                mismatch = warn_on_version_mismatch(pong)
+                if mismatch and auto_sync_enabled():
+                    self.sync_deployment()
+            self._fire_account_status()
+            return 0
+        except Exception:
+            # connect 失败必须拆掉 start() 拉起的事件监听线程。否则它持有的
+            # Redis pubsub 订阅(每实例 4 个 exec 事件频道)随丢弃的实例永久
+            # 留在服务端: 调用方重连风暴每次重试泄漏一个, 实测单日 8000+ 个
+            # subscribe 连接, 逼近 maxclients 后整个 Redis 拒绝新连接。
+            try:
+                self.stop()
+            except Exception:
+                log.exception("connect failed and event listener teardown failed")
+            raise
 
     def sync_deployment(self, dry_run=False):
         """Push this client's package into the QMT python directory.
@@ -4190,10 +4564,13 @@ class BigQmtXtTrader:
         """Remember what the deployment says it trades as."""
         try:
             reported = str((pong or {}).get("account_type") or "").strip().upper()
+            listed = [str(t or "").strip().upper()
+                      for t in ((pong or {}).get("account_types") or [])]
         except Exception:
             return
         if reported:
             self._server_account_type = reported
+            self._server_account_types = [t for t in listed if t]
             self._warn_on_account_type_mismatch()
 
     def _warn_on_account_type_mismatch(self):
@@ -4206,6 +4583,10 @@ class BigQmtXtTrader:
         server = self._server_account_type
         declared = self._declared_account_type
         if not server or not declared or server == declared:
+            return
+        # A deployment configured for several types (港股通 on a stock
+        # account) answers each request as the type its StockAccount named.
+        if declared in (getattr(self, "_server_account_types", None) or []):
             return
         log.warning(
             "account_type mismatch: this client asked for %s but the QMT "
@@ -4252,7 +4633,7 @@ class BigQmtXtTrader:
         channel = None
         account_id = str(self.client.account_id or "")
         try:
-            channel = self._build_quote_push_channel()
+            channel = _build_quote_push_channel(self.client)
             channel.start_subscriber(topics, self._on_push_exec_event)
             self._event_ready.set()          # see the redis path (#247)
             while self._event_running:
@@ -4260,6 +4641,9 @@ class BigQmtXtTrader:
                     return       # account changed -> rebuild against the new address
                 time.sleep(0.5)
         except Exception:
+            # 静默重试养大了 #366（方法不存在 -> AttributeError -> 永远收不到
+            # 回调，外面什么都看不见）。失败必须留痕。
+            log.exception("exec event push-channel round failed; retrying")
             time.sleep(1.0)
         finally:
             if channel is not None:
@@ -4413,7 +4797,10 @@ class BigQmtXtTrader:
                         error_msg=event.get("error_msg") or "",
                         order_sysid=_sysid,       # MiniQMT 规范名 (issue #65)
                         order_sys_id=_sysid,      # 兼容别名
-                        order_id=_sysid,
+                        # order_id 必须和 on_stock_order/order_stock 同型
+                        # (OrderId int 子类)，否则调用方拿到的废单号对不上
+                        # 下单返回值，也没法拿它撤单 (#363)。
+                        order_id=self._order_object_id(_sysid),
                         stock_code=event.get("stock_code") or "",
                         order_remark=str(
                             event.get("order_remark") or event.get("remark")
@@ -4434,7 +4821,7 @@ class BigQmtXtTrader:
                         error_msg=event.get("error_msg") or "",
                         order_sysid=_sysid,       # MiniQMT 规范名 (issue #65)
                         order_sys_id=_sysid,
-                        order_id=_sysid,
+                        order_id=self._order_object_id(_sysid),  # 同 #363
                         stock_code=event.get("stock_code") or "",
                         order_remark=str(
                             event.get("order_remark") or event.get("remark")
@@ -4457,7 +4844,8 @@ class BigQmtXtTrader:
     def query_stock_asset(self, account):
         account_id = _account_id(account, self.client.account_id)
         try:
-            data = self.client.call("query_stock_asset", {"account_id": account_id}, account_id=account_id) or {}
+            data = self.client.call("query_stock_asset", _with_account_type({"account_id": account_id}, account),
+                                    account_id=account_id) or {}
         except Exception:
             # #243: default is to let the failure through. Only an explicit
             # account_cache_fallback, with a dated and fresh snapshot, answers
@@ -4567,7 +4955,8 @@ class BigQmtXtTrader:
     def query_stock_positions(self, account):
         account_id = _account_id(account, self.client.account_id)
         try:
-            data = self.client.call("query_stock_positions", {"account_id": account_id}, account_id=account_id) or {}
+            data = self.client.call("query_stock_positions", _with_account_type({"account_id": account_id}, account),
+                                    account_id=account_id) or {}
         except Exception:
             if self._account_cache_usable(account_id, "query_stock_positions") is None:
                 raise
@@ -4585,7 +4974,7 @@ class BigQmtXtTrader:
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "query_position_statistics",
-            {"account_id": account_id},
+            _with_account_type({"account_id": account_id}, account),
             account_id=account_id,
         ) or {}
         return [self._position_statistics_object(account_id, item) for item in _as_list(data)]
@@ -4694,7 +5083,7 @@ class BigQmtXtTrader:
         try:
             data = self.client.call(
                 "query_stock_position",
-                {"account_id": account_id, "stock_code": stock_code},
+                _with_account_type({"account_id": account_id, "stock_code": stock_code}, account),
                 account_id=account_id,
             )
         except Exception:
@@ -4721,11 +5110,11 @@ class BigQmtXtTrader:
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "query_stock_orders",
-            {
+            _with_account_type({
                 "account_id": account_id,
                 "cancelable_only": bool(cancelable_only),
                 "strategy_name": strategy_name,
-            },
+            }, account),
             account_id=account_id,
         ) or []
         return [self._order_from_dict(account_id, item) for item in _as_list(data)]
@@ -4744,7 +5133,7 @@ class BigQmtXtTrader:
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "query_stock_trades",
-            {"account_id": account_id, "strategy_name": strategy_name},
+            _with_account_type({"account_id": account_id, "strategy_name": strategy_name}, account),
             account_id=account_id,
         ) or []
         return [self._trade_from_dict(account_id, item) for item in _as_list(data)]
@@ -4761,7 +5150,7 @@ class BigQmtXtTrader:
             -> {'ORDER': {'rows': 15, 'attributes': [...], 'error': ''}, ...}
         """
         account_id = _account_id(account, self.client.account_id)
-        params = {"account_id": account_id}
+        params = _with_account_type({"account_id": account_id}, account)
         if detail_types:
             params["detail_types"] = list(detail_types)
         return self.client.call("describe_trade_detail_fields", params,
@@ -4800,11 +5189,11 @@ class BigQmtXtTrader:
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "query_execution_snapshot",
-            {
+            _with_account_type({
                 "account_id": account_id,
                 "order_strategy_name": order_strategy_name,
                 "trade_strategy_name": trade_strategy_name,
-            },
+            }, account),
             account_id=account_id,
         ) or {}
         result = dict(data) if isinstance(data, dict) else {}
@@ -4903,7 +5292,7 @@ class BigQmtXtTrader:
         user_order_id = str(order_remark or "").strip()
         if not user_order_id:
             user_order_id = "bqrpc:%s:%s" % (int(time.time() * 1000), uuid.uuid4().hex[:10])
-        payload = {
+        payload = _with_account_type({
             "account_id": account_id,
             "stock_code": stock_code,
             "order_type": order_type,
@@ -4912,7 +5301,7 @@ class BigQmtXtTrader:
             "price": price,
             "strategy_name": strategy_name,
             "order_remark": user_order_id,
-        }
+        }, account)
         if not wait_settlement:
             payload["wait_settlement"] = False
         tracked = getattr(self.client, "call_tracked", None)
@@ -5185,8 +5574,10 @@ class BigQmtXtTrader:
         for job in jobs:
             seq, args, kwargs = job
             account_id = _account_id(args[0], self.client.account_id)
-            groups.setdefault(account_id, []).append(job)
-        for account_id, group in groups.items():
+            # By id AND type: one stock account's STOCK and HUGANGTONG
+            # cancels are different books on the server.
+            groups.setdefault((account_id, _account_type_param(args[0])), []).append(job)
+        for (account_id, _type), group in groups.items():
             if len(group) < self.ASYNC_CANCEL_BATCH_MIN:
                 for job in group:
                     self._submit_async_cancel_single(job)
@@ -5203,11 +5594,11 @@ class BigQmtXtTrader:
         try:
             data = self.client.call(
                 "cancel_order_stock_sysid",
-                {
+                _with_account_type({
                     "account_id": account_id,
                     "market": market,
                     "order_sysid": self._resolve_order_sys_id(order_id),
-                },
+                }, account),
                 account_id=account_id,
             ) or {}
             ok = bool(data.get("success", data))
@@ -5235,6 +5626,7 @@ class BigQmtXtTrader:
         and retrying would double-cancel -- report unknown-outcome per item
         instead."""
         payload = []
+        account = group[0][1][0] if group and group[0][1] else None
         for seq, args, kwargs in group:
             order_id = args[1] if len(args) > 1 else kwargs.get("order_id", "")
             market = args[2] if len(args) > 2 else kwargs.get("market", "")
@@ -5246,7 +5638,7 @@ class BigQmtXtTrader:
         try:
             results = self.client.call(
                 "cancel_order_stock_batch",
-                {"account_id": account_id, "items": payload},
+                _with_account_type({"account_id": account_id, "items": payload}, account),
                 account_id=account_id,
             ) or []
         except RpcServerRepliedError as exc:
@@ -5323,7 +5715,7 @@ class BigQmtXtTrader:
             entry = dict(item or {})
             entry.setdefault("account_id", account_id)
             payload.append(entry)
-        params = {"account_id": account_id, "items": payload}
+        params = _with_account_type({"account_id": account_id, "items": payload}, account)
         if timeout_seconds is None:
             timeout_seconds = max(
                 float(getattr(self.client, "timeout_seconds",
@@ -5486,8 +5878,11 @@ class BigQmtXtTrader:
         for job in jobs:
             fields = self._async_job_fields(job[1], job[2])
             account_id = _account_id(fields.get("account"), self.client.account_id)
-            groups.setdefault(account_id, []).append((job, fields))
-        for account_id, group in groups.items():
+            # By id AND type (港股通 orders on a stock account id are a
+            # different book on the server).
+            key = (account_id, _account_type_param(fields.get("account")))
+            groups.setdefault(key, []).append((job, fields))
+        for (account_id, _type), group in groups.items():
             if len(group) < self.ASYNC_BATCH_MIN:
                 for (seq, args, kwargs), _fields in group:
                     self._submit_async_single(seq, args, kwargs)
@@ -5532,7 +5927,10 @@ class BigQmtXtTrader:
             item.setdefault("signal_id", "rpc-%s" % uuid.uuid4().hex)
             payload.append(item)
         try:
-            results = self.order_stock_batch(account_id, payload,
+            # The first job's StockAccount, not the bare id: order_stock_batch
+            # sends its declared type along (港股通).
+            batch_account = (group[0][1] or {}).get("account") or account_id
+            results = self.order_stock_batch(batch_account, payload,
                                              idempotent=False) or []
         except RpcServerRepliedError as exc:
             log.warning("async batch of %d refused by the server (%s); "
@@ -5608,6 +6006,16 @@ class BigQmtXtTrader:
             "wait_for_sysid": False,
         })
 
+    def _has_push_channel(self):
+        """Whether exec events can reach this client at all (#345).
+
+        redis carries them on pub/sub, zmq on the PUB socket; pipe / mysql /
+        shm have no push path, so nothing the server emits after the reply
+        ever arrives.
+        """
+        transport_name = str(getattr(self.client, "transport_name", "redis") or "redis").lower()
+        return transport_name in ("redis", "", "default", "zmq")
+
     def _submit_async_single(self, seq, args, kwargs):
         """Submit one job and enqueue its outcome. Runs on the order worker."""
         stock_code = str(kwargs.get("stock_code") or (args[1] if len(args) > 1 else ""))
@@ -5617,7 +6025,13 @@ class BigQmtXtTrader:
             # wait_settlement=False：passorder 一返回就应答，不在 worker 里等
             # 服务端结算（那是 #69 要的吞吐）。委托号从推送事件学——屏障暂存的
             # 委托事件里会带上（触发 response 前至多等 2s，学不到就回落 remark）。
-            result = self.order_stock_result(*args, wait_settlement=False, **kwargs)
+            #
+            # 没有推送通道的传输（pipe / mysql）学不到任何事件，服务端为拒单
+            # 推的 order_error 也到不了（#345）。那里让 worker 等服务端结算：
+            # 调用方本来就不阻塞，而 server_error 会走下面的 except 变成
+            # on_order_error，否则一张资金不足被终端拦下的单永远没有回音。
+            result = self.order_stock_result(
+                *args, wait_settlement=not self._has_push_channel(), **kwargs)
         except Exception as exc:
             self._enqueue_async_outcome({
                 "kind": "error", "seq": seq, "remark": remark,
@@ -5858,7 +6272,7 @@ class BigQmtXtTrader:
             entry = dict(item or {})
             entry.setdefault("account_id", account_id)
             payload.append(entry)
-        params = {"account_id": account_id, "orders": payload}
+        params = _with_account_type({"account_id": account_id, "orders": payload}, account)
         if not idempotent:
             params["idempotent"] = False
         if batch_id:
@@ -5901,7 +6315,7 @@ class BigQmtXtTrader:
         passorder without placing an order -- use it to check your mapping.
         """
         account_id = _account_id(account, self.client.account_id)
-        params = {
+        params = _with_account_type({
             "account_id": account_id,
             "op_type": op_type,
             "order_code": order_code,
@@ -5910,7 +6324,7 @@ class BigQmtXtTrader:
             "volume": volume,
             "strategy_name": strategy_name,
             "user_order_id": user_order_id,
-        }
+        }, account)
         if order_type is not None:
             params["order_type"] = order_type
         if quick_trade is not None:
@@ -5930,12 +6344,12 @@ class BigQmtXtTrader:
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "cancel_order_stock_sysid",
-            {
+            _with_account_type({
                 "account_id": account_id,
                 "market": market,
                 # Send the broker's own 合同编号, not the int we derived from it.
                 "order_sysid": self._resolve_order_sys_id(order_sysid),
-            },
+            }, account),
             account_id=account_id,
         ) or {}
         return 0 if bool(data.get("success", data)) else -1
@@ -5958,7 +6372,8 @@ class BigQmtXtTrader:
     def _query_account_list(self, account, method):
         account_id = _account_id(account, self.client.account_id)
         try:
-            rows = self.client.call(method, {"account_id": account_id}, account_id=account_id) or []
+            rows = self.client.call(method, _with_account_type({"account_id": account_id}, account),
+                                    account_id=account_id) or []
         except Exception:
             return []
         # MiniQMT answers these by attribute (see CompatRow). The server
@@ -6048,7 +6463,7 @@ class BigQmtXtTrader:
                 error / callback_bound
         """
         account_id = _account_id(account, self.client.account_id)
-        params = {"account_id": account_id}
+        params = _with_account_type({"account_id": account_id}, account)
         if wait_seconds is not None:
             params["wait_seconds"] = float(wait_seconds)
         if max_age_seconds is not None:
@@ -6087,8 +6502,9 @@ class BigQmtXtTrader:
         try:
             return self.client.call(
                 "query_smt_secu_rate",
-                {"account_id": account_id, "stock_code": stock_code, "max_term": max_term,
-                 "fare_way": fare_way, "credit_type": credit_type, "trade_type": trade_type},
+                _with_account_type({"account_id": account_id, "stock_code": stock_code, "max_term": max_term,
+                                    "fare_way": fare_way, "credit_type": credit_type,
+                                    "trade_type": trade_type}, account),
                 account_id=account_id,
             ) or []
         except Exception:
@@ -6131,7 +6547,7 @@ class BigQmtXtTrader:
         try:
             data = self.client.call(
                 "get_new_purchase_limit",
-                {"account_id": account_id},
+                _with_account_type({"account_id": account_id}, account),
                 account_id=account_id,
             ) or {}
             if isinstance(data, dict):
@@ -6372,6 +6788,8 @@ class BigQmtXtTrader:
         action = item.get("action")
         order_type = (option_order_type(item.get("direction"), item.get("offset_flag"), action)
                       if self._account_type_value(item) == 6 else _action_to_order_type(action))
+        # #330 跟修：entrust 判据优先，op 判据兜底
+        order_type = _credit_order_type_for_row(item, order_type)
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or item.get("order_id") or "")
         return CompatObject(
             account_id=account_id,
@@ -6419,6 +6837,7 @@ class BigQmtXtTrader:
         action = item.get("action")
         order_type = (option_order_type(item.get("direction"), item.get("offset_flag"), action)
                       if self._account_type_value(item) == 6 else _action_to_order_type(action))
+        order_type = _credit_order_type_for_row(item, order_type)
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or "")
         trade_id = str(item.get("trade_id") or "")
         traded_volume = _safe_int(item.get("volume", item.get("traded_volume")))

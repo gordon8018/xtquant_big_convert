@@ -825,7 +825,18 @@ class BigQmtMarketDataProvider:
         big_kwargs_filled = dict(big_kwargs, fill_data=fill_data)
         positional_tail_filled = dict(positional_tail_kwargs, fill_data=fill_data)
 
-        return [
+        # subscribe 是 QMT 签名的最后一个参数（fill_data 之后）：True（大 QMT
+        # 默认）把查过的标的塞进常驻内存订阅池，批量拉分钟线时终端内存单调涨到
+        # 崩溃（#361）；False 只读本地已下载数据。和 fill_data 一样单独成
+        # shape、只在调用方给了才传——签名没有 subscribe 的终端 TypeError 后
+        # 仍落到下面的裸 shape。
+        subscribe = params.get("subscribe")
+        shapes = []
+        if subscribe is not None:
+            shapes.append(
+                (method_name, (), dict(big_kwargs_filled, subscribe=bool(subscribe))))
+
+        shapes.extend([
             (method_name, (), big_kwargs_filled),
             (method_name, (), big_kwargs),
             (method_name, (), mini_kwargs),
@@ -861,7 +872,8 @@ class BigQmtMarketDataProvider:
                     "fill_data": fill_data,
                 },
             ),
-        ]
+        ])
+        return shapes
 
     def _sector_codes(self, sector):
         """Cached sector listing. Membership does not change intraday and the
@@ -1394,7 +1406,19 @@ class BigQmtMarketDataProvider:
             # short of it was never padded, so trimming its head would drop
             # real bars. Verified live -- 1y count=10 comes back as exactly 10
             # rows, 7 of them pad.
-            if count > 0 and len(pairs) >= count:
+            #
+            # A date window (count=-1 with a start_time) is padded the same
+            # way when the window starts before the terminal's local coverage
+            # (#335: 601318.SH 1mon from 20250901 with 1d data anchored at
+            # 2025-12-10 -- three head rows flat at 68.40, the first real
+            # close, zero turnover; MiniQMT returns no rows for those months).
+            # There is no count to fall short of, so every leading flat
+            # zero-turnover row at the head of a window is pad. The servant
+            # is called with its default skip_paused=True, so a genuinely
+            # suspended period does not come back as a row here in the first
+            # place -- the only flat zero-turnover rows it produces are pad.
+            window_request = count <= 0 and bool(str(kwargs.get("start_time") or "").strip())
+            if (count > 0 and len(pairs) >= count) or window_request:
                 pad = _leading_synthetic_bars([row for _label, row in pairs])
                 if pad:
                     trimmed += pad
