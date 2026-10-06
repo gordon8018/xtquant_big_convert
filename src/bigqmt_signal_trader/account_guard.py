@@ -75,8 +75,12 @@ def _redis():
     if _redis_client is None:
         import redis as _redis_mod
         cfg = dict(_cfg("BIGQMT_REDIS_CONFIG", {}) or {})
-        cfg.setdefault("decode_responses", True)
-        _redis_client = _redis_mod.Redis(**cfg)
+        # 只取连接参数：配置里还有 transport/rpc_* 等桥自用键，塞给
+        # redis.Redis 会 TypeError（2026-10-06 生产实证，fail-closed 兜住）。
+        conn = {k: cfg[k] for k in ("host", "port", "db", "username", "password")
+                if k in cfg}
+        conn.setdefault("decode_responses", True)
+        _redis_client = _redis_mod.Redis(**conn)
     return _redis_client
 
 

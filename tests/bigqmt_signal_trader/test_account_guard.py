@@ -197,3 +197,21 @@ def test_redis_cfg_override_tightens_limit():
     h = _handler()
     ok = account_guard.check_submit_allowed(h, "submit_order", BUY, NOW)
     assert ok[1].startswith("SINGLE_STOCK_CAP")
+
+
+def test_redis_client_filters_non_connection_keys(monkeypatch):
+    calls = {}
+
+    class FakeR:
+        def __init__(self, **kw):
+            calls.update(kw)
+
+    monkeypatch.setitem(sys.modules, "redis", types.SimpleNamespace(Redis=FakeR))
+    monkeypatch.setattr(account_guard, "_redis_client", None)
+    monkeypatch.setattr(account_guard, "_cfg", lambda n, d: (
+        {"host": "x", "port": 6380, "db": 5, "password": "p",
+         "transport": "redis", "rpc_allow_order_methods": True}
+        if n == "BIGQMT_REDIS_CONFIG" else d))
+    account_guard._redis()
+    assert calls.get("host") == "x" and "transport" not in calls
+    account_guard.set_redis(None)
