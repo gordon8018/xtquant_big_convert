@@ -215,3 +215,13 @@ def test_redis_client_filters_non_connection_keys(monkeypatch):
     account_guard._redis()
     assert calls.get("host") == "x" and "transport" not in calls
     account_guard.set_redis(None)
+
+
+def test_clearing_window_distorted_snapshot_skips_checks():
+    """清算/盘前: 持仓有量无市值 → 跳过回撤与占比, 不误写停买(2026-10-06 20:05 实证)。"""
+    h = _handler(total=69_633.0,                              # 比基线 88,321 "跌" 21%
+                positions=[FakePosition("601238.SH", 3200, 0)])  # 有量无市值
+    account_guard._redis().set("bigqmt:risk:baseline:A1",
+                               '{"date": "20261008", "total": 88321.0}')
+    assert account_guard.check_submit_allowed(h, "submit_order", BUY, NOW) is None
+    assert "bigqmt:risk:stopbuy:A1" not in account_guard._redis().store  # 未误写停买

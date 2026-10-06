@@ -158,7 +158,7 @@ def _positions(handler, account):
         rows = handler.position_provider.get_positions(account) or []
     except Exception as exc:
         return None, "POSITIONS_UNAVAILABLE:get_positions failed: %s" % exc
-    by_code, total = {}, 0.0
+    by_code, total, distorted = {}, 0.0, False
     for row in rows:
         code = str(getattr(row, "stock_code", "") or "")
         volume = float(getattr(row, "volume", 0) or 0)
@@ -167,9 +167,13 @@ def _positions(handler, account):
         mv = getattr(row, "market_value", None)
         if mv is None:
             mv = getattr(row, "m_dInstrumentValue", 0) or 0
-        by_code[code] = by_code.get(code, 0.0) + float(mv or 0)
-        total += float(mv or 0)
-    snap = {"by_code": by_code, "total": total}
+        mv = float(mv or 0)
+        if mv <= 0:
+            # 有持仓但市值为 0 → 清算/盘前窗口, 快照不可信
+            distorted = True
+        by_code[code] = by_code.get(code, 0.0) + mv
+        total += mv
+    snap = {"by_code": by_code, "total": total, "distorted": distorted}
     _pos_cache = (now, snap)
     return snap, ""
 
@@ -222,6 +226,15 @@ def _check_buy(handler, account, method, params, today):
     total, err = _asset_total(handler, account)
     if err:
         return _fail(err)
+    pos, err = _positions(handler, account)
+    if err:
+        return _fail(err)
+    if pos.get("distorted"):
+        # 清算/盘前窗口: 持仓有量无市值, 总资产被清掉一块, 回撤/占比全是假信号
+        # (2026-10-06 20:05 实证: 总资产 88,321→69,633, 假回撤 21%)。跳过检查、
+        # 不写停买——夜单/竞价是计划内委托, 误拦的代价更高。基线也不在此窗口建立。
+        log.warning("account_guard %s: 持仓市值快照疑似清算期(有量无市值), 跳过回撤/占比检查", account)
+        return None
     try:
         r = _redis()
         base_key = "bigqmt:risk:baseline:%s" % account
@@ -241,9 +254,6 @@ def _check_buy(handler, account, method, params, today):
             return (False, reason)
     except Exception as exc:
         return _fail("RISK_STATE_UNAVAILABLE:%s" % exc)
-    pos, err = _positions(handler, account)
-    if err:
-        return _fail(err)
     if pos["total"] + amount > lim["max_total_ratio"] * total:
         return (False, "TOTAL_POSITION_CAP:%.0f+%.0f>%.0f%%x%.0f" % (
             pos["total"], amount, lim["max_total_ratio"] * 100, total))
