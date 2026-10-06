@@ -19,6 +19,7 @@ import uuid
 
 from .adapters.redis_common import decode_text
 from .code_utils import normalize_stock_code
+from .market_guard import SUBMIT_METHODS, check_order_allowed
 from .models import AccountSnapshot, OrderRef, OrderRequest
 
 
@@ -777,10 +778,13 @@ class BigQmtRpcHandlers:
             raise ValueError("rpc method is not allowed: %s" % requested_method)
         if method in ORDER_METHODS and not self.allow_order_methods:
             raise PermissionError("order rpc methods are disabled")
-        if method in market_guard.SUBMIT_METHODS:
+        if method in SUBMIT_METHODS:
             # 交易日闸门：非交易日(周末/节假日)拒绝新开委托；cancel/查询不拦。
             # fail-closed：日历不可用同样拒绝(错杀一天代价已知, 假日下单代价未知)。
-            allowed, reason = market_guard.check_order_allowed()
+            # 导入形式必须是 `from .market_guard import check_order_allowed`：
+            # `from . import market_guard` 在 QMT 加载器下静默不绑定
+            # (fromlist 返回子模块 → IMPORT_FROM 取不到属性)，2026-10-06 生产踩坑。
+            allowed, reason = check_order_allowed()
             if not allowed:
                 raise PermissionError(reason)
         # query_stock_positions is list-shaped in MiniQMT.  It remains an
