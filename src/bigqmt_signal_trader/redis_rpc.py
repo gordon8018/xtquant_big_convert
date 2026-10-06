@@ -18,6 +18,7 @@ import traceback
 import uuid
 
 from .adapters.redis_common import decode_text
+from .account_guard import check_submit_allowed
 from .code_utils import normalize_stock_code
 from .market_guard import SUBMIT_METHODS, check_order_allowed
 from .models import AccountSnapshot, OrderRef, OrderRequest
@@ -779,6 +780,10 @@ class BigQmtRpcHandlers:
         if method in ORDER_METHODS and not self.allow_order_methods:
             raise PermissionError("order rpc methods are disabled")
         if method in SUBMIT_METHODS:
+            # 账户级聚合风控：kill 熔断优先（拦一切），其余只拦买入；卖出永不拦。
+            block = check_submit_allowed(self, method, params)
+            if block is not None:
+                raise PermissionError(block[1])
             # 交易日闸门：非交易日(周末/节假日)拒绝新开委托；cancel/查询不拦。
             # fail-closed：日历不可用同样拒绝(错杀一天代价已知, 假日下单代价未知)。
             # 导入形式必须是 `from .market_guard import check_order_allowed`：

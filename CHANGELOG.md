@@ -3,6 +3,14 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.58] - 2026-10-06
+
+### 新增
+
+- **账户级聚合风控（account_guard）**：与交易日闸门同一钩子，submit/passorder 直通必经。kill 熔断（Redis `bigqmt:risk:kill:<account>`，拦一切提交，优先级最高、不受开关影响）；停买标志（隔日自动失效）；当日总资产回撤 ≥ 阈值自动停买（基线存 Redis，重启不丢）；总仓位占比与单票占比上限拒买。**卖出永不拦**（降风险方向）。数据源为桥内 position_provider（QMT 原生查询，零漂移），失败 fail-closed（60s 重试）。默认限值为跑偏保护轨（总仓 98% / 单票 40% / 日回撤 10%），部署配置与 Redis 运行期覆盖均可调。
+- **deploy/risk_ctl.py**：Mac 侧风控操作台——`kill`（急停+撤全部可撤委托+企微通知）/ `resume` / `stopbuy` / `set-limits` / `status`，走 Redis 标志，桥每个 submit 实时读取，无需重启策略。
+
+
 ## [0.3.57] - 2026-10-06
 
 ### 新增
