@@ -3,6 +3,14 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.57] - 2026-10-06
+
+### 新增
+
+- **下单前置交易日闸门（market_guard）**：`submit_order` / `submit_orders_batch` / 原生 `passorder` 直通在触达 passorder 前先过 A 股交易日历（QMT 终端本地 `xtdata.get_trading_dates`，SH 市场口径），非交易日拒绝并返回 `MARKET_CLOSED:*`；日历不可用 fail-closed 同样拒绝（`MARKET_CALENDAR_UNAVAILABLE:*`，60s 后重试）；`cancel_*` 与查询类方法不拦。部署配置 `BIGQMT_MARKET_GUARD = False` 可关闭（默认开启）。
+  背景：2026-10-06 国庆休市日，上游策略的卖出路径把真实委托打进券商（客户端回"下单成功"，实际废单或留存到节后开盘成交）。桥是所有委托的必经之地，在此 fail-closed 一层，策略侧各自的日历缺口不再是资金风险。
+
+
 ## [0.3.56] - 2026-09-24
 
 ### 修复
